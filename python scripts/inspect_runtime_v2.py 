@@ -1,0 +1,581 @@
+```python
+"""Real-runtime adapter implementing agent_runtime_tests_v2 contracts.
+
+This module bridges `tests/v2/contracts.py` to the Enterprise Agent Runtime classes:
+- SkillLoader
+- SkillRegistry
+- WorkflowEngine
+- ExecutionStateManager
+- FileCheckpointStore
+- MCPServer
+
+Because exact module paths and constructor signatures vary across repository branches,
+this module resolves symbols dynamically across common Enterprise Agent Runtime layouts
+and adapts both positional/keyword invocation styles and DTO shapes cleanly while
+preserving crashes, errors, audit IDs, and integrity checks.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import dataclasses
+import hashlib
+import hmac
+import importlib
+import inspect
+import json
+import os
+import tempfile
+import uuid
+from pathlib import Path
+from typing import Any, Protocol, runtime_checkable
+
+
+# =============================================================================
+# Exception & Integrity Primitives
+# =============================================================================
+
+
+class SimulatedProcessCrash(RuntimeError):
+    """Fallback crash exception type if the runtime does not define one."""
+
+
+class CheckpointIntegrityError(RuntimeError):
+    """Raised when a checkpoint fails SHA-256 or external HMAC-SHA256 verification."""
+
+
+class MCPAuthorizationError(PermissionError):
+    """Raised when an MCP tool or resource call fails authentication or scope checks."""
+
+    def __init__(self, message: str, audit_id: str | None = None) -> None:
+        super().__init__(message)
+        self.audit_id = audit_id or f"audit-{uuid.uuid4()}"
+
+
+# =============================================================================
+# Contract DTOs & Protocol Definitions (with fallback if contracts.py differs)
+# =============================================================================
+
+
+def _load_contracts_module() -> Any:
+    """Attempt to import tests.v2.contracts (or tests.v2.contracts.py variants)."""
+    candidates = (
+        "tests.v2.contracts",
+        "agent_runtime_tests_v2.contracts",
+    )
+    for mod_name in candidates:
+        try:
+            return importlib.import_module(mod_name)
+        except ImportError:
+            continue
+    return None
+
+
+_CONTRACTS_MOD = _load_contracts_module()
+
+
+def _resolve_contract_attr(name: str, fallback: Any) -> Any:
+    if _CONTRACTS_MOD is not None and hasattr(_CONTRACTS_MOD, name):
+        return getattr(_CONTRACTS_MOD, name)
+    return fallback
+
+
+@dataclasses.dataclass
+class TaskResultDTO:
+    """Normalized representation of a task execution outcome."""
+
+    task_id: str
+    status: str
+    output: Any = None
+    error: str | None = None
+    attempts: int = 1
+    metadata: dict[str, Any] = dataclasses.field(default_factory=dict)
+
+
+@dataclasses.dataclass
+class WorkflowResultDTO:
+    """Normalized representation of a workflow run outcome."""
+
+    workflow_id: str
+    status: str
+    tasks: dict[str, TaskResultDTO] = dataclasses.field(default_factory=dict)
+    outputs: dict[str, Any] = dataclasses.field(default_factory=dict)
+    error: str | None = None
+    checkpoint_id: str | None = None
+    metadata: dict[str, Any] = dataclasses.field(default_factory=dict)
+
+
+@dataclasses.dataclass
+class MCPResponseDTO:
+    """Normalized response for MCP tool invocations and resource reads."""
+
+    allowed: bool
+    audit_id: str
+    data: Any = None
+    error: str | None = None
+    status_code: int = 200
+    metadata: dict[str, Any] = dataclasses.field(default_factory=dict)
+
+
+@dataclasses.dataclass
+class CheckpointVerificationDTO:
+    """Normalized result for checkpoint integrity and HMAC signature checks."""
+
+    valid: bool
+    reason: str
+    checkpoint_id: str | None = None
+    sha256: str | None = None
+    hmac_verified: bool = False
+
+
+TaskResultContract = _resolve_contract_attr("TaskResult", TaskResultDTO)
+WorkflowResultContract = _resolve_contract_attr("WorkflowResult", WorkflowResultDTO)
+MCPResponseContract = _resolve_contract_attr("MCPResponse", MCPResponseDTO)
+CheckpointVerificationContract = _resolve_contract_attr(
+    "CheckpointVerification", CheckpointVerificationDTO
+)
+
+
+@runtime_checkable
+class RuntimeSessionProtocol(Protocol):
+    """Session contract expected by tests/v2/contracts.py."""
+
+    def build_parallel_workflow(self) -> Any: ...
+
+    async def run_workflow(
+        self,
+        workflow: Any,
+        *,
+        workflow_id: str | None = None,
+        initial_state: dict[str, Any] | None = None,
+        resume_from_checkpoint: bool = False,
+    ) -> Any: ...
+
+    async def invoke_mcp_tool(
+        self,
+        tool_name: str,
+        arguments: dict[str, Any] | None = None,
+        *,
+        auth_token: str | None = None,
+        scopes: set[str] | list[str] | tuple[str, ...] | None = None,
+    ) -> Any: ...
+
+    async def read_mcp_resource(
+        self,
+        resource_uri: str,
+        *,
+        auth_token: str | None = None,
+        scopes: set[str] | list[str] | tuple[str, ...] | None = None,
+    ) -> Any: ...
+
+    async def save_checkpoint(
+        self,
+        checkpoint_id: str,
+        state: dict[str, Any],
+    ) -> str: ...
+
+    async def restore_checkpoint(
+        self,
+        checkpoint_id: str | None = None,
+    ) -> dict[str, Any]: ...
+
+    def verify_checkpoint(
+        self,
+        checkpoint_id: str | None = None,
+    ) -> Any: ...
+
+
+@runtime_checkable
+class RuntimeAdapterProtocol(Protocol):
+    """Top-level adapter contract exposed via create_adapter()."""
+
+    async def create_session(self, fault_injector: Any = None) -> RuntimeSessionProtocol: ...
+
+
+# =============================================================================
+# Runtime Symbol Discovery Helpers
+# =============================================================================
+
+
+def _find_runtime_class(class_name: str) -> type[Any] | None:
+    """Locate a runtime class across standard package paths without silent faking."""
+    module_candidates = (
+        f"enterprise_agent_runtime.{class_name.lower()}",
+        f"enterprise_agent_runtime.skills.{class_name.lower()}",
+        f"enterprise_agent_runtime.workflow.{class_name.lower()}",
+        f"enterprise_agent_runtime.state.{class_name.lower()}",
+        f"enterprise_agent_runtime.checkpoint.{class_name.lower()}",
+        f"enterprise_agent_runtime.checkpoints.{class_name.lower()}",
+        f"enterprise_agent_runtime.mcp.{class_name.lower()}",
+        f"enterprise_agent_runtime.core.{class_name.lower()}",
+        "enterprise_agent_runtime",
+        "enterprise_agent_runtime.skills",
+        "enterprise_agent_runtime.workflow",
+        "enterprise_agent_runtime.state",
+        "enterprise_agent_runtime.checkpoint",
+        "enterprise_agent_runtime.checkpoints",
+        "enterprise_agent_runtime.mcp",
+        "your_project.runtime",
+    )
+    for mod_path in module_candidates:
+        try:
+            mod = importlib.import_module(mod_path)
+            sym = getattr(mod, class_name, None)
+            if isinstance(sym, type):
+                return sym
+        except ImportError:
+            continue
+    return None
+
+
+def _construct_with_candidates(cls: type[Any], candidates: list[tuple[tuple[Any, ...], dict[str, Any]]]) -> Any:
+    """Instantiate a class using the first signature candidate that succeeds cleanly."""
+    last_exc: Exception | None = None
+    for args, kwargs in candidates:
+        try:
+            return cls(*args, **kwargs)
+        except TypeError as exc:
+            last_exc = exc
+            continue
+    if last_exc is not None:
+        raise last_exc
+    return cls()
+
+
+async def _maybe_await(value: Any) -> Any:
+    """Await coroutines/awaitables while returning synchronous values directly."""
+    if inspect.isawaitable(value):
+        return await value
+    return value
+
+
+def _build_dto(dto_cls: Any, fallback_cls: type[Any], **kwargs: Any) -> Any:
+    """Construct the contracts DTO if compatible, falling back to local dataclass."""
+    for target in (dto_cls, fallback_cls):
+        if target is None:
+            continue
+        try:
+            if dataclasses.is_dataclass(target):
+                valid_fields = {f.name for f in dataclasses.fields(target)}
+                filtered = {k: v for k, v in kwargs.items() if k in valid_fields}
+                return target(**filtered)
+            return target(**kwargs)
+        except TypeError:
+            continue
+    return fallback_cls(**kwargs)
+
+
+def _is_crash_exception(exc: BaseException) -> bool:
+    """Identify crash exceptions that must never be swallowed."""
+    crash_names = {"SimulatedProcessCrash", "ProcessCrashError", "SimulatedCrash"}
+    return isinstance(exc, (SimulatedProcessCrash, SystemExit, KeyboardInterrupt)) or (
+        type(exc).__name__ in crash_names
+    )
+
+
+# =============================================================================
+# Fault Injection Instrumentation
+# =============================================================================
+
+REQUIRED_FAULT_POINTS: tuple[str, ...] = (
+    "task.after_effect.before_checkpoint",
+    "task.after_checkpoint",
+    "checkpoint.before_write",
+    "checkpoint.after_write",
+    "mcp.before_invoke",
+    "mcp.after_invoke",
+)
+
+
+def task_before_execute_point(task_id: str) -> str:
+    """Format the per-task pre-execution fault injection point name."""
+    return f"task.before_execute:{task_id}"
+
+
+async def emit_fault_point(
+    fault_injector: Any,
+    point_name: str,
+    context: dict[str, Any] | None = None,
+) -> Any:
+    """Trigger a fault injection point on the session's FaultInjector instance.
+
+    - Applies async delays (`asyncio.sleep`) without blocking the event loop.
+    - Never catches or suppresses SimulatedProcessCrash or crash exceptions.
+    """
+    if fault_injector is None:
+        return None
+
+    payload = dict(context or {})
+    payload.setdefault("point", point_name)
+
+    method_names = (
+        "inject",
+        "trigger",
+        "on_point",
+        "check",
+        "apply",
+        "fault",
+        "run_point",
+    )
+    for method_name in method_names:
+        hook = getattr(fault_injector, method_name, None)
+        if not callable(hook):
+            continue
+
+        try:
+            sig = inspect.signature(hook)
+            positional_params = [
+                p
+                for p in sig.parameters.values()
+                if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)
+            ]
+            if len(positional_params) >= 2:
+                outcome = hook(point_name, payload)
+            elif len(positional_params) == 1:
+                outcome = hook(point_name)
+            else:
+                outcome = hook()
+        except (TypeError, ValueError):
+            outcome = hook(point_name, payload)
+        except BaseException as exc:
+            if _is_crash_exception(exc):
+                raise
+            raise
+
+        try:
+            outcome = await _maybe_await(outcome)
+        except BaseException as exc:
+            if _is_crash_exception(exc):
+                raise
+            raise
+
+        # Handle structured delay instructions asynchronously
+        delay_seconds: float | None = None
+        if isinstance(outcome, dict):
+            for key in ("delay_seconds", "delay", "sleep_seconds"):
+                if key in outcome and outcome[key] is not None:
+                    delay_seconds = float(outcome[key])
+                    break
+        elif hasattr(outcome, "delay_seconds") and getattr(outcome, "delay_seconds") is not None:
+            delay_seconds = float(getattr(outcome, "delay_seconds"))
+
+        if delay_seconds is not None and delay_seconds > 0:
+            await asyncio.sleep(delay_seconds)
+
+        # If a fault object carries an exception to raise, raise it explicitly
+        exc_to_raise = None
+        if isinstance(outcome, dict) and isinstance(outcome.get("exception"), BaseException):
+            exc_to_raise = outcome["exception"]
+        elif hasattr(outcome, "exception") and isinstance(getattr(outcome, "exception"), BaseException):
+            exc_to_raise = getattr(outcome, "exception")
+
+        if exc_to_raise is not None:
+            raise exc_to_raise
+
+        return outcome
+
+    return None
+
+
+# =============================================================================
+# Durable Idempotency Ledger & External HMAC Checkpoint Guard
+# =============================================================================
+
+
+class DurableIdempotencyLedger:
+    """Durable JSON-backed ledger tracking side-effect execution keys across crashes/restarts."""
+
+    def __init__(self, ledger_path: Path) -> None:
+        self._path = ledger_path
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        self._io_lock = asyncio.Lock()
+        if not self._path.exists():
+            self._atomic_write({})
+
+    def _atomic_write(self, data: dict[str, Any]) -> None:
+        tmp_path = self._path.with_name(f".{self._path.name}.{uuid.uuid4().hex}.tmp")
+        tmp_path.write_text(
+            json.dumps(data, indent=2, sort_keys=True, default=str),
+            encoding="utf-8",
+        )
+        os.replace(tmp_path, self._path)
+
+    def _read_unlocked(self) -> dict[str, Any]:
+        if not self._path.exists():
+            return {}
+        raw = self._path.read_text(encoding="utf-8").strip()
+        if not raw:
+            return {}
+        parsed = json.loads(raw)
+        return parsed if isinstance(parsed, dict) else {}
+
+    async def execute_idempotent(
+        self,
+        idempotency_key: str,
+        effect_fn: Any,
+    ) -> tuple[Any, bool]:
+        """Execute `effect_fn` at most once for `idempotency_key`.
+
+        Returns `(result, was_replayed)`.
+        """
+        async with self._io_lock:
+            existing = self._read_unlocked()
+            if idempotency_key in existing and existing[idempotency_key].get("committed"):
+                return existing[idempotency_key].get("result"), True
+
+        result = await _maybe_await(effect_fn())
+
+        async with self._io_lock:
+            latest = self._read_unlocked()
+            if idempotency_key in latest and latest[idempotency_key].get("committed"):
+                return latest[idempotency_key].get("result"), True
+            latest[idempotency_key] = {
+                "committed": True,
+                "result": result,
+            }
+            self._atomic_write(latest)
+        return result, False
+
+
+class ExternalCheckpointSigner:
+    """Stores SHA-256 and HMAC-SHA256 metadata outside the checkpoint file/directory."""
+
+    def __init__(self, signing_key: bytes, metadata_dir: Path) -> None:
+        if not signing_key:
+            raise ValueError("HMAC signing key must be non-empty.")
+        self._signing_key = signing_key
+        self._metadata_dir = metadata_dir
+        self._metadata_dir.mkdir(parents=True, exist_ok=True)
+
+    def _meta_file(self, target_path: Path) -> Path:
+        path_digest = hashlib.sha256(str(target_path.resolve()).encode("utf-8")).hexdigest()
+        return self._metadata_dir / f"{path_digest}.sig.json"
+
+    @staticmethod
+    def _compute_bytes(target_path: Path) -> bytes:
+        if target_path.is_file():
+            return target_path.read_bytes()
+        if target_path.is_dir():
+            hasher = hashlib.sha256()
+            for child in sorted(target_path.rglob("*")):
+                if child.is_file():
+                    hasher.update(str(child.relative_to(target_path)).encode("utf-8"))
+                    hasher.update(b"\x00")
+                    hasher.update(child.read_bytes())
+                    hasher.update(b"\x01")
+            return hasher.digest()
+        raise FileNotFoundError(f"Checkpoint path does not exist: {target_path}")
+
+    def sign(self, target_path: Path, checkpoint_id: str | None = None) -> dict[str, Any]:
+        """Compute SHA-256 + HMAC-SHA256 outside the checkpoint artifact and persist."""
+        payload_bytes = self._compute_bytes(target_path)
+        sha256_hex = hashlib.sha256(payload_bytes).hexdigest()
+        hmac_hex = hmac.new(self._signing_key, payload_bytes, hashlib.sha256).hexdigest()
+        record = {
+            "checkpoint_id": checkpoint_id or target_path.stem,
+            "target_path": str(target_path.resolve()),
+            "sha256": sha256_hex,
+            "hmac_sha256": hmac_hex,
+        }
+        self._meta_file(target_path).write_text(
+            json.dumps(record, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+        return record
+
+    def verify(self, target_path: Path, checkpoint_id: str | None = None) -> CheckpointVerificationDTO:
+        """Verify SHA-256 and HMAC-SHA256 before checkpoint restore."""
+        if not target_path.exists():
+            return CheckpointVerificationDTO(
+                valid=False,
+                reason="checkpoint_not_found",
+                checkpoint_id=checkpoint_id,
+                hmac_verified=False,
+            )
+
+        meta_path = self._meta_file(target_path)
+        if not meta_path.exists():
+            return CheckpointVerificationDTO(
+                valid=False,
+                reason="missing_external_signature",
+                checkpoint_id=checkpoint_id,
+                hmac_verified=False,
+            )
+
+        try:
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            payload_bytes = self._compute_bytes(target_path)
+        except Exception as exc:
+            return CheckpointVerificationDTO(
+                valid=False,
+                reason=f"checkpoint_read_error:{exc}",
+                checkpoint_id=checkpoint_id,
+                hmac_verified=False,
+            )
+
+        actual_sha256 = hashlib.sha256(payload_bytes).hexdigest()
+        actual_hmac = hmac.new(self._signing_key, payload_bytes, hashlib.sha256).hexdigest()
+
+        expected_sha256 = str(meta.get("sha256", ""))
+        expected_hmac = str(meta.get("hmac_sha256", ""))
+
+        sha_ok = hmac.compare_digest(actual_sha256, expected_sha256)
+        hmac_ok = hmac.compare_digest(actual_hmac, expected_hmac)
+
+        if not sha_ok:
+            return CheckpointVerificationDTO(
+                valid=False,
+                reason="sha256_mismatch",
+                checkpoint_id=checkpoint_id or meta.get("checkpoint_id"),
+                sha256=actual_sha256,
+                hmac_verified=False,
+            )
+        if not hmac_ok:
+            return CheckpointVerificationDTO(
+                valid=False,
+                reason="hmac_signature_invalid",
+                checkpoint_id=checkpoint_id or meta.get("checkpoint_id"),
+                sha256=actual_sha256,
+                hmac_verified=False,
+            )
+
+        return CheckpointVerificationDTO(
+            valid=True,
+            reason="verified",
+            checkpoint_id=checkpoint_id or meta.get("checkpoint_id"),
+            sha256=actual_sha256,
+            hmac_verified=True,
+        )
+
+
+# =============================================================================
+# Real Runtime Session & Adapter
+# =============================================================================
+
+
+class RealRuntimeSession:
+    """Session bound to an isolated skills directory and shared checkpoint root."""
+
+    # Required scopes per MCP tool and resource URI prefix
+    TOOL_REQUIRED_SCOPES: dict[str, set[str]] = {
+        "echo": {"mcp:tool:invoke", "tool:echo"},
+        "read_file": {"mcp:tool:invoke", "tool:read"},
+        "write_file": {"mcp:tool:invoke", "tool:write"},
+    }
+    RESOURCE_REQUIRED_SCOPES: dict[str, set[str]] = {
+        "file://": {"mcp:resource:read", "resource:read"},
+        "memory://": {"mcp:resource:read", "resource:read"},
+        "state://": {"mcp:resource:read", "resource:read"},
+    }
+
+    def __init__(
+        self,
+        *,
+        checkpoint_root: Path,
+        external_sig_dir: Path,
+        ledger_path: Path,
+        signing_key: bytes,
+        fault_injector: Any = None,
+    ) -> None:
+        self.checkpoint_root = checkpoint_root
+        self.checkpoint_root.mkdir(parent
