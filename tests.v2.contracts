@@ -1,0 +1,223 @@
+from __future__ import annotations
+
+import asyncio
+import hashlib
+import hmac
+import json
+import os
+import tempfile
+from pathlib import Path
+from typing import Any
+
+# Replace `<runtime_pkg>` with your actual package path discovered in Phase A.
+# from <runtime_pkg>.checkpoint.file_store import FileCheckpointStore
+# from <runtime_pkg>.mcp.server import MCPServer
+# from <runtime_pkg>.skills.loader import SkillLoader
+# from <runtime_pkg>.skills.registry import SkillRegistry
+# from <runtime_pkg>.state.manager import ExecutionStateManager
+# from <runtime_pkg>.workflow.engine import WorkflowEngine
+# from tests.v2.contracts import ...
+
+
+class DurableIdempotencyLedger:
+    """Durable JSON-backed ledger recording committed side effects."""
+
+    def __init__(self, ledger_path: Path) -> None:
+        self._path = ledger_path
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        self._lock = asyncio.Lock()
+        if not self._path.exists():
+            self._write_atomic({})
+
+    def _write_atomic(self, payload: dict[str, Any]) -> None:
+        tmp_path = self._path.with_suffix(".tmp")
+        tmp_path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+        os.replace(tmp_path, self._path)
+
+    def _read_all(self) -> dict[str, Any]:
+        if not self._path.exists():
+            return {}
+        return json.loads(self._path.read_text(encoding="utf-8"))
+
+    async def has_committed(self, idempotency_key: str) -> bool:
+        async with self._lock:
+            return idempotency_key in self._read_all()
+
+    async def record_once(self, idempotency_key: str, record: dict[str, Any]) -> tuple[bool, dict[str, Any]]:
+        """Returns (newly_recorded, effective_record)."""
+        async with self._lock:
+            data = self._read_all()
+            if idempotency_key in data:
+                return False, data[idempotency_key]
+            data[idempotency_key] = record
+            self._write_atomic(data)
+            return True, record
+
+
+class CheckpointIntegrityGuard:
+    """Verifies SHA-256 and external HMAC-SHA256 signatures outside checkpoint payloads."""
+
+    def __init__(self, signing_key: bytes, sig_store_dir: Path) -> None:
+        self._signing_key = signing_key
+        self._sig_store_dir = sig_store_dir
+        self._sig_store_dir.mkdir(parents=True, exist_ok=True)
+
+    def _sig_path_for(self, checkpoint_path: Path) -> Path:
+        digest_name = hashlib.sha256(str(checkpoint_path.resolve()).encode("utf-8")).hexdigest()
+        return self._sig_store_dir / f"{digest_name}.sig.json"
+
+    def sign_file(self, checkpoint_path: Path) -> dict[str, str]:
+        raw = checkpoint_path.read_bytes()
+        sha256_hex = hashlib.sha256(raw).hexdigest()
+        mac_hex = hmac.new(self._signing_key, raw, hashlib.sha256).hexdigest()
+        meta = {"sha256": sha256_hex, "hmac_sha256": mac_hex}
+        self._sig_path_for(checkpoint_path).write_text(json.dumps(meta), encoding="utf-8")
+        return meta
+
+    def verify_file(self, checkpoint_path: Path) -> tuple[bool, str]:
+        if not checkpoint_path.exists():
+            return False, "checkpoint_missing"
+        sig_file = self._sig_path_for(checkpoint_path)
+        if not sig_file.exists():
+            return False, "missing_external_signature"
+        meta = json.loads(sig_file.read_text(encoding="utf-8"))
+        raw = checkpoint_path.read_bytes()
+        actual_sha = hashlib.sha256(raw).hexdigest()
+        actual_mac = hmac.new(self._signing_key, raw, hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(actual_sha, meta.get("sha256", "")):
+            return False, "sha256_mismatch"
+        if not hmac.compare_digest(actual_mac, meta.get("hmac_sha256", "")):
+            return False, "hmac_signature_invalid"
+        return True, "ok"
+
+
+async def invoke_fault_point(
+    fault_injector: Any,
+    point_name: str,
+    context: dict[str, Any] | None = None,
+) -> Any:
+    """Invoke fault injection point without blocking the event loop or swallowing crashes."""
+    if fault_injector is None:
+        return None
+
+    payload = context or {}
+    # Support common fault injector hook signatures while letting crash exceptions propagate.
+    for method_name in ("inject", "trigger", "check", "apply", "on_point"):
+        fn = getattr(fault_injector, method_name, None)
+        if callable(fn):
+            result = fn(point_name, payload) if _accepts_two_args(fn) else fn(point_name)
+            if asyncio.iscoroutine(result):
+                result = await result
+            if isinstance(result, dict) and "delay_seconds" in result:
+                delay = float(result["delay_seconds"])
+                if delay > 0:
+                    await asyncio.sleep(delay)
+            return result
+    return None
+
+
+def _accepts_two_args(fn: Any) -> bool:
+    try:
+        import inspect
+
+        sig = inspect.signature(fn)
+        positional = [
+            p
+            for p in sig.parameters.values()
+            if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)
+        ]
+        return len(positional) >= 2
+    except (TypeError, ValueError):
+        return False
+
+
+class RealRuntimeSession:
+    """Encapsulates one test session bound to an isolated skills dir and shared checkpoint root."""
+
+    def __init__(
+        self,
+        *,
+        checkpoint_root: Path,
+        signing_key: bytes,
+        external_sig_dir: Path,
+        fault_injector: Any = None,
+    ) -> None:
+        self.checkpoint_root = checkpoint_root
+        self.checkpoint_root.mkdir(parents=True, exist_ok=True)
+        self.fault_injector = fault_injector
+        self.skills_dir = Path(tempfile.mkdtemp(prefix="v2_skills_"))
+        self.ledger = DurableIdempotencyLedger(checkpoint_root.parent / "idempotency_ledger.json")
+        self.integrity = CheckpointIntegrityGuard(signing_key=signing_key, sig_store_dir=external_sig_dir)
+
+        # Instantiate real runtime components (wire exact constructor args from Phase A):
+        # self.skill_registry = SkillRegistry()
+        # self.skill_loader = SkillLoader(self.skill_registry)
+        # self.checkpoint_store = FileCheckpointStore(root_dir=str(self.checkpoint_root))
+        # self.state_manager = ExecutionStateManager(...)
+        # self.mcp_server = MCPServer(...)
+        # self.workflow_engine = WorkflowEngine(...)
+
+    async def register_sample_skills(self) -> None:
+        """Create deterministic sample skills in self.skills_dir and load via SkillLoader/SkillRegistry."""
+        sample_skills = ["alpha_skill", "beta_skill", "join_skill"]
+        for name in sample_skills:
+            skill_path = self.skills_dir / f"{name}.py"
+            skill_path.write_text(
+                f'async def execute(payload: dict):\n    return {{"skill": "{name}", "input": payload}}\n',
+                encoding="utf-8",
+            )
+        # Wire actual SkillLoader / SkillRegistry calls here and ensure deterministic behavior.
+
+    def build_parallel_workflow(self) -> dict[str, Any]:
+        """Build two independent tasks ('branch_a', 'branch_b') followed by a dependent join ('join_ab')."""
+        return {
+            "tasks": [
+                {"id": "branch_a", "skill": "alpha_skill", "deps": []},
+                {"id": "branch_b", "skill": "beta_skill", "deps": []},
+                {"id": "join_ab", "skill": "join_skill", "deps": ["branch_a", "branch_b"]},
+            ]
+        }
+
+    async def close(self) -> None:
+        """Clean up temporary skills directory while preserving checkpoint_root."""
+        if self.skills_dir.exists():
+            for child in self.skills_dir.rglob("*"):
+                if child.is_file():
+                    child.unlink(missing_ok=True)
+            for child in sorted(self.skills_dir.rglob("*"), reverse=True):
+                if child.is_dir():
+                    child.rmdir()
+            self.skills_dir.rmdir()
+
+
+class RealRuntimeAdapter:
+    """Adapter implementing tests/v2/contracts.py against the real Enterprise Agent Runtime."""
+
+    def __init__(
+        self,
+        checkpoint_root: Path | None = None,
+        signing_key: bytes | None = None,
+    ) -> None:
+        self._base_dir = Path(tempfile.mkdtemp(prefix="v2_runtime_env_"))
+        self._checkpoint_root = checkpoint_root or (self._base_dir / "checkpoints")
+        self._checkpoint_root.mkdir(parents=True, exist_ok=True)
+        self._sig_dir = self._base_dir / "checkpoint_signatures"
+        self._sig_dir.mkdir(parents=True, exist_ok=True)
+        # Key stored outside checkpoint artifacts (in adapter/env memory or external store).
+        env_key = os.environ.get("RUNTIME_V2_CHECKPOINT_HMAC_KEY", "").encode("utf-8")
+        self._signing_key = signing_key or env_key or os.urandom(32)
+
+    async def create_session(self, fault_injector: Any = None) -> RealRuntimeSession:
+        session = RealRuntimeSession(
+            checkpoint_root=self._checkpoint_root,
+            signing_key=self._signing_key,
+            external_sig_dir=self._sig_dir,
+            fault_injector=fault_injector,
+        )
+        await session.register_sample_skills()
+        return session
+
+
+def create_adapter() -> RealRuntimeAdapter:
+    """Entry point required by agent_runtime_tests_v2."""
+    return RealRuntimeAdapter()
