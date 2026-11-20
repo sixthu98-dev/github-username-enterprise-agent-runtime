@@ -1,0 +1,9 @@
+python -m pip install -e '.[test]'
+
+export AGENT_RUNTIME_TEST_ADAPTER="your_project.tests.runtime_adapter:create_adapter"
+
+pytest -q --require-runtime \
+  --junitxml=artifacts/test-evidence/junit.xml
+
+python scripts/acceptance_gate.py \
+  artifacts/test-evidence/pytest-evidence.json
