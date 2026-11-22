@@ -1,0 +1,55 @@
+name: Agentic Workflow DB Pipeline CI
+on:
+push:
+branches: [main, master, develop]
+pull_request:
+branches: [main, master, develop]
+workflow_dispatch:
+jobs:
+verify-engine-and-pipeline:
+name: Verify WorkflowEngine & AgenticWorkflowDBPipeline
+runs-on: ubuntu-latest
+steps:
+- name: Checkout repository
+uses: actions/checkout@v4
+- name: Set up Python 3.11
+uses: actions/setup-python@v5
+with:
+python-version: "3.11"
+- name: Install package and test dependencies
+run: |
+python -m pip install --upgrade pip
+python -m pip install -e '.[test]'
+- name: Run self.engine workflow engine unit tests
+run: |
+python -m unittest tests/unit/test_workflow_engine.py -v
+- name: Run self.pipeline database pipeline unit & pytest suites
+run: |
+python -m unittest tests/unit/test_agentic_workflow_db_pipeline.py -v
+pytest -v tests/unit/test_workflow_db_pipeline_pytest.py
+- name: Run runtime adapter pytest suite & collect evidence
+env:
+AGENT_RUNTIME_TEST_ADAPTER: "your_project.tests.runtime_adapter:create_adapter"
+run: |
+mkdir -p artifacts/test-evidence
+pytest -q --require-runtime 
+--junitxml=artifacts/test-evidence/junit.xml
+- name: Verify acceptance gate
+run: |
+python scripts/acceptance_gate.py 
+artifacts/test-evidence/pytest-evidence.json
+- name: Execute Workflow DB CI runner for self.engine and self.pipeline
+run: |
+mkdir -p artifacts
+python scripts/run_workflow_db_ci.py 
+--tests tests/unit/test_workflow_engine.py tests/unit/test_agentic_workflow_db_pipeline.py tests/unit/test_workflow_db_pipeline_pytest.py 
+--min-flow-rate 1.0 
+--json-report artifacts/workflow_db_ci_report.json
+- name: Upload CI verification and test evidence artifacts
+if: always()
+uses: actions/upload-artifact@v4
+with:
+name: workflow-db-ci-report
+path: |
+artifacts/workflow_db_ci_report.json
+artifacts/test-evidence/
